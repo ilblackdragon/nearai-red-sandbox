@@ -7,6 +7,7 @@
 //! Explicitly requested tests fail when the patched HVF supervisor, mvmctl,
 //! or the pinned opencode prerequisite is unavailable; they never pass by skipping.
 
+mod canary;
 mod copy;
 mod exec;
 mod files;

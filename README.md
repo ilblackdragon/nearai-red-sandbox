@@ -150,6 +150,10 @@ this Mac's CPU count or RAM, and both override `limits.cpus` and
 `limits.memoryMiB` in the session file. Every session-file key, with its
 default, is in the [session file reference](docs/operations.md#session-file).
 
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Synthetic canaries
+
+Add managed guest decoys or host-only markers to a session to investigate suspicious reproduction code. SandBox detects exact token matches in returned tool text and exported files, shows redacted tool-result notices, and retains observation records. See [managed canaries](docs/canaries.md) for configuration, a first investigation, and detection limits.
+
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Network access
 
 Guest network access is off by default. To reach a target or fetch packages,

@@ -47,6 +47,9 @@ pub struct BridgeOptions {
     /// Network session: `shell` runs under the guest proxy environment.
     #[serde(default)]
     pub proxy: bool,
+    /// Host-only registry created by the launcher. Never supplied by guest input.
+    #[serde(default)]
+    pub canary_registry: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +88,25 @@ pub fn parse_request(raw: &[u8]) -> Result<Request, String> {
     {
         return Err("bad tool request: cwd must be an absolute guest path".into());
     }
+    if o.canary_registry.as_ref().is_some_and(|p| !p.is_absolute()) {
+        return Err("bad tool request: canaryRegistry must be absolute".into());
+    }
     Ok(r)
+}
+
+/// Poison future tool calls and let teardown distinguish incomplete monitoring
+/// from a genuine no-match result. Do not persist any token-bearing error.
+fn monitoring_failure(o: &BridgeOptions, message: &str) -> Outcome {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    StateDir(o.state_dir.clone()).mark("canary monitoring failed");
+    let marker = std::fs::OpenOptions::new()
+        .write(true).create_new(true).mode(0o600)
+        .open(o.state_dir.join("canary-monitoring-failed"));
+    if let Ok(mut marker) = marker {
+        let _ = marker.write_all(b"canary monitoring failed; observation coverage incomplete\n");
+    }
+    Outcome::fail(EXIT_TOOL_ERROR, message.into())
 }
 
 /// Run one call against any `Exec`. Split out so tests can drive it
@@ -94,6 +115,13 @@ pub fn call(tool: &str, sb: &dyn Exec, o: &BridgeOptions, input: &Value, leak_sh
     if !SANDBOXED_TOOLS.contains(&tool) {
         return Outcome::fail(EXIT_BAD_REQUEST, format!("tool not allowed in sandbox: {tool}"));
     }
+    // Load before any guest action: a configured but unavailable monitor is
+    // not permission to execute an unobserved tool call. Keep registry errors
+    // generic: a malformed host file must never surface token material.
+    let registry = match o.canary_registry.as_deref().map(crate::canary::Registry::load).transpose() {
+        Ok(registry) => registry,
+        Err(_) => return monitoring_failure(o, "canary monitoring unavailable; tool was not executed"),
+    };
     let limits = ToolLimits {
         timeout_ms: o.timeout_ms,
         max_output_bytes: o.max_output_bytes,
@@ -101,11 +129,36 @@ pub fn call(tool: &str, sb: &dyn Exec, o: &BridgeOptions, input: &Value, leak_sh
         leak_shell,
         proxy: o.proxy,
     };
-    match (Tools { sb, limits }).call(tool, input) {
+    let mut outcome = match (Tools { sb, limits }).call(tool, input) {
         Ok(text) => Outcome::ok(text),
         Err(e @ Error::Unavailable(_)) => Outcome::fail(EXIT_UNAVAILABLE, e.to_string()),
         Err(e) => Outcome::fail(EXIT_TOOL_ERROR, e.to_string()),
+    };
+    if let Some(registry) = registry {
+        // serde_json serializes Value object keys in sorted order. This is a
+        // canonicalInputSha256, not tools.jsonl's insertion-ordered JS hash.
+        let canonical = serde_json::to_vec(input).expect("JSON Value serialization is infallible");
+        let hash = hex::encode(ring::digest::digest(&ring::digest::SHA256, &canonical));
+        let matches = match registry.observe_tool(tool, &hash, &mut outcome.stdout, &mut outcome.stderr) {
+            Ok(matches) => matches,
+            // Discard both channels on monitoring failure. They can contain
+            // tokens even when observation/redaction failed part way through.
+            Err(_) => return monitoring_failure(o, "canary monitoring failed after tool execution; result withheld"),
+        };
+        if matches > 0 {
+            let notice = format!(
+                "\n\n[rts canary observation] {matches} exact token match observation(s) recorded in canaries.jsonl. \
+                 Synthetic tokens were redacted as [canary:ID]. Investigate whether this collection was relevant to the task. \
+                 An output match does not establish a file read or external exfiltration."
+            );
+            if outcome.code == EXIT_OK {
+                outcome.stdout.push_str(&notice);
+            } else {
+                outcome.stderr.push_str(&notice);
+            }
+        }
     }
+    outcome
 }
 
 /// The real entry point: read stdin, attach to the session's machine, run.
@@ -192,6 +245,119 @@ mod tests {
         assert!(parse(request(json!({ "cwd": "relative" }))).unwrap_err().contains("absolute"));
         assert!(parse(request(json!({ "net": true }))).unwrap_err().contains("unknown field"));
         assert!(parse_request(b"not json").is_err());
+    }
+
+    #[test]
+    fn configured_canary_registry_is_checked_before_guest_execution() {
+        let rec = Recorder::new(|_, _| ok(b"should not execute"));
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let r = parse(request(json!({ "canaryRegistry": dir.path().join("missing.json"), "stateDir": state }))).unwrap();
+        let out = call("shell", &rec, &r.options, &json!({ "command": "id" }), false);
+        assert_eq!(out.code, EXIT_TOOL_ERROR);
+        assert!(out.stderr.contains("canary monitoring unavailable"));
+        assert!(out.stdout.is_empty());
+        assert!(rec.argvs().is_empty());
+        assert!(state.join("canary-monitoring-failed").is_file());
+        assert!(StateDir(state).dead_reason().unwrap().contains("canary monitoring failed"));
+    }
+
+    #[test]
+    fn a_relative_canary_registry_is_refused() {
+        let error = parse(request(json!({ "canaryRegistry": "relative.json" }))).unwrap_err();
+        assert!(error.contains("absolute"), "{error}");
+    }
+
+    fn canary_fixture() -> (tempfile::TempDir, crate::canary::Registry, Request, String, String) {
+        use crate::canary::{CanarySpec, Placement, Registry};
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::create(
+            &[
+                CanarySpec { id: "host-key".into(), placement: Placement::Host },
+                CanarySpec { id: "guest-key".into(), placement: Placement::Guest },
+            ],
+            &dir.path().join("canaries"),
+            &dir.path().join("canaries.jsonl"),
+        ).unwrap();
+        let host = std::fs::read_to_string(dir.path().join("canaries/host/host-key.token")).unwrap().trim().to_string();
+        let guest = registry.guest_files().into_iter().find(|(p, _)| p.ends_with("/guest-key.token")).unwrap().1;
+        let guest = String::from_utf8(guest).unwrap().trim().to_string();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let request = parse(request(json!({ "canaryRegistry": registry.path(), "stateDir": state }))).unwrap();
+        (dir, registry, request, host, guest)
+    }
+
+    #[test]
+    fn tool_output_matches_are_redacted_and_observed_without_raw_values() {
+        let (dir, _registry, request, host, guest) = canary_fixture();
+        // The shell tool combines guest stdout and stderr into returned text.
+        let rec = Recorder::new(|_, _| crate::testutil::reply(7, host.as_bytes(), guest.as_bytes()));
+        let input = json!({ "workdir": "/in", "command": "inspect" });
+        let out = call("shell", &rec, &request.options, &input, false);
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.stdout.contains("[canary:host-key]"));
+        assert!(out.stdout.contains("[canary:guest-key]"));
+        assert!(out.stdout.contains("exit status: 7"));
+        assert!(out.stdout.contains("2 exact token match observation(s)"));
+        assert!(!out.stdout.contains(&host));
+        assert!(!out.stdout.contains(&guest));
+        let audit = std::fs::read_to_string(dir.path().join("canaries.jsonl")).unwrap();
+        assert!(!audit.contains(&host));
+        assert!(!audit.contains(&guest));
+        let records: Vec<Value> = audit.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(records.len(), 2);
+        let expected = hex::encode(ring::digest::digest(&ring::digest::SHA256, &serde_json::to_vec(&input).unwrap()));
+        assert!(records.iter().all(|r| r["canonicalInputSha256"] == expected));
+    }
+
+    #[test]
+    fn tool_error_channels_are_redacted_and_keep_failure_status() {
+        struct Failing(String);
+        impl Exec for Failing {
+            fn exec(&self, _: &[String], _: &crate::sandbox::ExecOptions) -> crate::sandbox::Result<crate::sandbox::ExecResult> {
+                Err(Error::Other(format!("failed with {}", self.0)))
+            }
+        }
+        let (_dir, _registry, request, host, _) = canary_fixture();
+        let out = call("shell", &Failing(host.clone()), &request.options, &json!({"command":"fail"}), false);
+        assert_eq!(out.code, EXIT_TOOL_ERROR);
+        assert!(out.stdout.is_empty());
+        assert!(!out.stderr.contains(&host));
+        assert!(out.stderr.contains("[canary:host-key]"));
+        assert!(out.stderr.contains("1 exact token match observation(s)"));
+    }
+
+    #[test]
+    fn failed_canary_persistence_withholds_the_entire_tool_result() {
+        let (dir, _registry, request, host, _) = canary_fixture();
+        let audit = dir.path().join("canaries.jsonl");
+        let rec = Recorder::new(|_, _| {
+            // Break persistence after successful registry loading but before
+            // observation, rather than testing a pre-execution refusal.
+            std::fs::remove_file(&audit).unwrap();
+            std::fs::create_dir(&audit).unwrap();
+            ok(host.as_bytes())
+        });
+        let out = call("shell", &rec, &request.options, &json!({"command":"inspect"}), false);
+        assert_eq!(rec.argvs().len(), 1);
+        assert_eq!(out.code, EXIT_TOOL_ERROR);
+        assert!(out.stdout.is_empty());
+        assert!(out.stderr.contains("result withheld"));
+        assert!(!out.stderr.contains(&host));
+        assert!(request.options.state_dir.join("canary-monitoring-failed").is_file());
+        assert!(StateDir(request.options.state_dir.clone()).dead_reason().is_some());
+    }
+
+    #[test]
+    fn configured_monitor_does_not_change_unmatched_tool_output() {
+        let (_dir, _registry, request, _, _) = canary_fixture();
+        let rec = Recorder::new(|_, _| ok(b"ordinary output"));
+        let out = call("shell", &rec, &request.options, &json!({"command":"inspect"}), false);
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "ordinary output");
+        assert!(out.stderr.is_empty());
     }
 
     #[test]

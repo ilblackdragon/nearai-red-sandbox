@@ -31,6 +31,7 @@ adds to `network.allow`, and `--no-network` clears it.
 
 | Key | Default | What it does |
 |---|---|---|
+| `canaries` | `[]` | Managed synthetic markers: `{ "id": "review-key", "placement": "guest" }` or `"host"`. See [canaries](canaries.md). |
 | `inputsDir` | none | A host directory copied into the guest at `/in` before the session starts. |
 | `provider.models` | DeepSeek V4.1 Flash Abliterated | NEAR AI models the session may use. Each one's attestation is verified at launch. |
 | `provider.id`, `provider.baseURL`, `provider.apiKeyEnv` | NEAR AI through IronWire | An external OpenAI-compatible provider instead of NEAR AI. It is unattested, so launching needs `--allow-unattested-provider`. |
