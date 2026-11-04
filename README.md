@@ -157,22 +157,71 @@ agent stage the requested inputs, choose network access, submit an initial
 prompt, and retrieve the results. It supports both programmable terminals
 such as Rex and commands you run yourself.
 
-**Install in Codex:** ask Codex:
+**Install for your agent:** use the [Skills CLI](https://github.com/vercel-labs/skills)
+(requires Node.js 22.20 or later). This command installs the skill for use across projects,
+using agent detection or an interactive agent picker:
+
+```sh
+npx skills add nearai/nearai-red-sandbox --skill nearai-red-sandbox --global
+```
+
+To target an agent directly, append `--agent` with a selector from the table.
+For example, install for Claude Code, OpenCode, and Codex together:
+
+```sh
+npx skills add nearai/nearai-red-sandbox --skill nearai-red-sandbox --global \
+  --agent claude-code opencode codex
+```
+
+| Agent | `--agent` selector |
+| --- | --- |
+| Claude Code | `claude-code` |
+| OpenCode | `opencode` |
+| Codex | `codex` |
+| Cursor | `cursor` |
+| Gemini CLI | `gemini-cli` |
+| GitHub Copilot | `github-copilot` |
+| Antigravity | `antigravity` |
+| Factory Droid | `droid` |
+| Devin for Terminal | `devin` |
+| Grok Build | `grok` |
+| Kimi Code | `kimi-code-cli` |
+| Pi | `pi` |
+| Qwen Code | `qwen-code` |
+| Hermes Agent | `hermes-agent` |
+| Amp | `amp` |
+| Cline | `cline` |
+| Roo Code | `roo` |
+| Windsurf | `windsurf` |
+| Kiro CLI | `kiro-cli` |
+
+See the installer's [full agent list and compatibility notes](https://github.com/vercel-labs/skills/blob/main/docs/agents.md)
+for additional agents and custom-agent configuration. Omit `--global` to install
+only in the current project. This is a standalone Agent Skills package; it does
+not require Superpowers or a plugin marketplace.
+
+**Alternatively, in Codex:** ask:
 
 > Install the skill from
 > https://github.com/nearai/nearai-red-sandbox/tree/main/skills/nearai-red-sandbox
 
-The skill will be available on your next turn. For another agent that supports
-skills, copy the entire `skills/nearai-red-sandbox` directory into that agent's
-skill location, including its `references` directory. Installing the skill
-does not install the sandbox CLI: the machine running the sandbox needs
-`rts` v0.1.2 or later and its setup dependencies, on Apple-silicon macOS.
+For manual installation, copy the entire `skills/nearai-red-sandbox` directory,
+including `references`, into your agent's skill directory. Start a new agent
+session after installation and ask it to load the `nearai-red-sandbox` skill.
+The selectors above describe installation support, not end-to-end validation
+of every agent. An agent with terminal access can launch the sandbox; an agent
+without it can prepare a command for you to run.
+
+Installing the skill does not install the sandbox CLI: the machine running the
+sandbox needs `rts` v0.1.2 or later and its setup dependencies, on Apple-silicon
+macOS. The outer agent can be any of the agents above; the sandbox's interactive
+agent remains OpenCode.
 
 **Launch through Rex:** invoke the skill with the file, investigation question,
 and terminal preference:
 
-> $nearai-red-sandbox Review ~/Downloads/submission.jsonl to determine whether
-> the reported bug is supported by the evidence. Use Rex to launch a new
+> Use the nearai-red-sandbox skill to review ~/Downloads/submission.jsonl
+> to determine whether the reported bug is supported by the evidence. Use Rex to launch a new
 > sandbox, allow public GitHub access, and save the report to /out/report.md.
 
 The agent opens a named tab, submits the task with `--prompt-file`, and checks
@@ -181,8 +230,8 @@ Other programmable terminals can use the same launcher command.
 
 **Get a command to run yourself:** make that preference explicit:
 
-> $nearai-red-sandbox Prepare a command for me to run on my Mac to review
-> ~/Downloads/submission.jsonl with public GitHub access. Save the report to
+> Use the nearai-red-sandbox skill to prepare a command for me to run on my
+> Mac to review ~/Downloads/submission.jsonl with public GitHub access. Save the report to
 > /out/report.md. Do not launch it for me.
 
 The agent supplies a shell block that stages the input, writes the config and
