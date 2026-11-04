@@ -1,0 +1,4 @@
+interface:
+  display_name: "NEAR AI Red Sandbox"
+  short_description: "Launch sandbox investigations or prepare CLI commands"
+  default_prompt: "Use $nearai-red-sandbox to prepare and launch a scoped investigation, or give me a command to run."
