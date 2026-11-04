@@ -125,6 +125,8 @@ rts launch --config ./session.json --prompt-file ./handoff.md
 OpenCode stays interactive after submission. Choose one prompt option; files
 are relative to your current directory and can contain up to 64 KiB of text.
 
+For agent-driven workflows, use the [sandbox skill](skills/nearai-red-sandbox/SKILL.md). It supports programmable terminals such as Rex and commands the operator runs manually.
+
 Save any files you want to keep under `/out`. On teardown, SandBox exports that
 directory and removes the VM. Export and cleanup failures are recorded in
 `launcher.log`; check it before relying on the results. Other guest files are
