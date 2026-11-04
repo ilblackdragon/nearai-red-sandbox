@@ -61,6 +61,13 @@ lists the limits at their defaults and leaves the ceiling out so it keeps
 following memory. The [launcher and inference setup](../opencode/README.md)
 covers what each part does in more depth.
 
+For embedded NEAR AI inference, OpenCode uses the bundled IronWire proxy's
+context capacity (currently 128,000 tokens) instead of its generic model
+default. Replies are limited to 16,384 tokens and automatic compaction starts
+at 95,232 tokens, leaving 32,768 tokens for a reply and estimation/tool-result
+headroom. This is the proxy's enforced capacity, not a claim about the model's
+maximum supported window. Explicit external providers keep their own limits.
+
 ## Dependency setup and verification
 
 The curl installer installs under `~/.local` (`RTS_INSTALL_PREFIX`

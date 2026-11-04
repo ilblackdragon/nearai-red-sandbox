@@ -76,8 +76,11 @@ impl Host for RealHost {
 /// `embedded` is `OperatorConfig::embedded_inference`: only rts's own,
 /// attested NEAR AI inference is shown as NEAR AI Red.
 pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool) -> Value {
+    // Match the bundled proxy's admission policy, not OpenCode's generic
+    // 200k fallback or a model catalog's larger advertised window.
+    let context = ironwire_upstream::openai_chat::nearai_capabilities().context_tokens;
     let models: serde_json::Map<String, Value> = p.models.iter().map(|m| {
-        let model = if p.id == EMBEDDED_PROVIDER_ID {
+        let mut model = if p.id == EMBEDDED_PROVIDER_ID {
             // Invalid route values must fail closed rather than silently use a
             // different backend or model. Embedded startup validates these IDs.
             let route = crate::inference::route_header(m).unwrap_or_else(|_| "invalid".into());
@@ -85,13 +88,17 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         } else {
             json!({ "name": model_display_name(m), "tool_call": true })
         };
+        if embedded {
+            // OpenCode prefers input to context when deciding to compact.
+            model["limit"] = json!({ "context": context, "input": context, "output": 16_384 });
+        }
         (m.clone(), model)
     }).collect();
     let api_key = match &p.api_key_env {
         Some(k) => format!("{{env:{k}}}"),
         None => PLACEHOLDER_API_KEY.to_string(),
     };
-    json!({
+    let mut config = json!({
         "$schema": "https://opencode.ai/config.json",
         // v1 tuple form; v2.2.2 normalizes it to { package, options } (core/src/config/normalize.ts).
         "plugin": [[plugin_dir.to_string_lossy(), plugin_options]],
@@ -110,7 +117,13 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         "share": "disabled",
         // opencode is pinned by rts setup; never check for or offer updates.
         "autoupdate": false,
-    })
+    });
+    if embedded {
+        // OpenCode 2.2.2 compacts at input - buffer. Reserve one reply plus
+        // headroom for tool results and the proxy's byte-based token estimate.
+        config["compaction"] = json!({ "auto": true, "buffer": 32_768 });
+    }
+    config
 }
 
 pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool) -> Result<PathBuf, String> {
@@ -1277,6 +1290,37 @@ mod tests {
         let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false);
         assert_eq!(c["provider"]["ironwire"]["name"], "ironwire");
         assert_eq!(c["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
+    }
+
+    #[test]
+    fn embedded_context_limits_match_the_proxy_and_compact_before_admission_fails() {
+        let p = ProviderConfig { id: EMBEDDED_PROVIDER_ID.into(), ..provider() };
+        let c = opencode_config(Path::new("/p"), &json!({}), &p, true);
+        let capacity = u64::from(ironwire_upstream::openai_chat::nearai_capabilities().context_tokens);
+        for model in c["provider"][EMBEDDED_PROVIDER_ID]["models"].as_object().unwrap().values() {
+            assert_eq!(model["limit"]["context"], capacity);
+            // OpenCode prefers input over context; override inherited catalog limits too.
+            assert_eq!(model["limit"]["input"], capacity);
+            let output = model["limit"]["output"].as_u64().unwrap();
+            let buffer = c["compaction"]["buffer"].as_u64().unwrap();
+            assert!(output > 0 && buffer >= 2 * output && buffer < capacity);
+            // The 142,386-token conversation from the incident must already be due
+            // for compaction, with room for both a reply and estimation overhead.
+            assert!(142_386 > capacity - buffer);
+        }
+        assert_eq!(c["compaction"]["auto"], true);
+    }
+
+    #[test]
+    fn external_context_limits_are_not_replaced_with_embedded_capacity() {
+        for id in ["ironwire", EMBEDDED_PROVIDER_ID] {
+            let p = ProviderConfig { id: id.into(), ..provider() };
+            let c = opencode_config(Path::new("/p"), &json!({}), &p, false);
+            assert!(c.get("compaction").is_none());
+            for model in c["provider"][id]["models"].as_object().unwrap().values() {
+                assert!(model.get("limit").is_none());
+            }
+        }
     }
 
     #[test]
