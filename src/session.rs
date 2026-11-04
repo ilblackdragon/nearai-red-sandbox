@@ -54,6 +54,22 @@ pub fn initialize_guest_storage(sb: &dyn Exec) -> Result<(), String> {
     Ok(())
 }
 
+/// Install only launcher-generated files into a new private guest directory.
+/// mkdir (without -p) refuses a preexisting namespace before writing any token.
+pub fn install_canary_files(sb: &dyn Exec, registry: &crate::canary::Registry) -> Result<(), String> {
+    let manifest = registry.manifest_path();
+    let dir = manifest.rsplit_once('/').ok_or("invalid canary manifest path")?.0;
+    let result = sb.exec(&crate::files::script("mkdir -m 700 -- \"$1\"", &[dir]), &ExecOptions::new(30_000, 4096))
+        .map_err(|e| e.to_string())?;
+    if result.exit_code != 0 {
+        return Err("could not create fresh managed guest canary directory".into());
+    }
+    for (path, data) in registry.guest_files() {
+        crate::files::guest_write(sb, &path, &data).map_err(|_| "could not install managed guest canary files".to_string())?;
+    }
+    Ok(())
+}
+
 /// Runs a command on the host. A trait so tests can stand in for
 /// `opencode --version`, `ps` and `pgrep`.
 pub trait Host: Send + Sync {
@@ -147,7 +163,17 @@ pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Val
          them, ask the operator to relaunch with an appropriate --allow-host entry \
          or supply the necessary files as inputs."
     };
-    let context = format!("{}\n## Session network policy\n\n{network}\n", include_str!("sandbox-context.md"));
+    let mut context = format!("{}\n## Session network policy\n\n{network}\n", include_str!("sandbox-context.md"));
+    if let Some(manifest) = plugin_options["canaryManifest"].as_str() {
+        context.push_str(&format!(
+            "\n## Synthetic canaries\n\nThe operator enabled managed canaries. Read the value-free manifest at {manifest} for IDs, placements and paths. \
+             Host canary contents stay outside the guest; guest decoys are synthetic, not real credentials. \
+             Tool-result notices report exact token matches in returned text and redact their values. \
+             Investigate why submitted code collected a decoy; an intentional control read also triggers a notice. \
+             Notices do not prove external exfiltration. No match is not proof of no access: suppressed, encoded, partial or truncated contents are not covered. \
+             Export scanning runs after the agent exits; the operator reviews canaries.jsonl and canary-summary.json.\n"
+        ));
+    }
     let instructions = dir.join("sandbox-context.md");
     write_private(&instructions, context.as_bytes()).map_err(|e| format!("writing {}: {e}", instructions.display()))?;
     let instructions = fs::canonicalize(&instructions).map_err(|e| format!("resolving {}: {e}", instructions.display()))?;
@@ -680,6 +706,45 @@ struct Live<'a> {
     network_pids: Vec<u32>,
     /// mvm's audit directory, read at teardown into `network.jsonl`.
     audit_dir: Option<PathBuf>,
+    canaries: Option<crate::canary::Registry>,
+    monitoring_failed: bool,
+    canary_setup_complete: bool,
+}
+
+/// Return true for incomplete coverage or persistence/cleanup failure.
+fn finish_canaries(registry: &crate::canary::Registry, paths: &SessionPaths, export_complete: bool, setup_complete: bool, log: &Logger) -> bool {
+    let tool_failed = paths.state_dir.join("canary-monitoring-failed").exists();
+    let scan = if export_complete {
+        if paths.out_dir.exists() { registry.scan_exports(&paths.out_dir) } else { Ok(0) }
+    } else {
+        Err("export did not complete; canary export scan skipped".into())
+    };
+    let summary = registry.summary();
+    // Values are per-session runtime state, never retained with exported reports.
+    // Cleanup status participates in the persisted result, not just the exit code.
+    let cleanup_ok = fs::remove_dir_all(paths.runtime.join("canaries")).is_ok();
+    if !cleanup_ok { log.log("canaries: FAILED to remove private token runtime directory"); }
+    let mut failed = !setup_complete || tool_failed || scan.is_err() || summary.is_err() || !cleanup_ok;
+    let text = summary.as_deref().unwrap_or("canary observation summary unavailable");
+    let status = if failed { "incomplete" } else { "complete" };
+    let record = json!({
+        "status": status,
+        "setup": if setup_complete { "complete" } else { "incomplete" },
+        "tokenCleanup": if cleanup_ok { "complete" } else { "failed" },
+        "exportScan": if scan.is_ok() { "complete" } else { "incomplete" },
+        "exportObservations": scan.as_ref().ok(),
+        "toolMonitoring": if tool_failed { "incomplete" } else { "complete" },
+        "summary": text,
+        "limits": "Exact token matches only; no match is not proof of no access. Exported files retain their original bytes.",
+    });
+    if write_private(&paths.session_dir.join("canary-summary.json"), &(record.to_string() + "\n").into_bytes()).is_err() {
+        log.log("canaries: FAILED to persist session summary");
+        failed = true;
+    }
+    let status = if failed { "incomplete" } else { "complete" };
+    log.log(&format!("canaries: {status}; {text}"));
+    if scan.is_err() { log.log("canaries: export scanning incomplete; do not interpret missing events as clean"); }
+    failed
 }
 
 impl Live<'_> {
@@ -706,15 +771,23 @@ impl Live<'_> {
         if let Err(e) = &quiesced {
             self.log.log(&format!("teardown: EXPORT SKIPPED: cannot quiesce tools: {e}"));
         }
+        let mut export_complete = false;
         if self.machine_created && quiesced.is_ok() {
             // copyOut runs on the launcher's own handle, which is not yet marked removed.
             match self.sb.copy_out("/out", &self.paths.out_dir) {
                 Ok(CopyOutResult::Exported { files, bytes }) => {
+                    export_complete = true;
                     self.log.log(&format!("teardown: exported {files} files, {bytes} bytes to {}", self.paths.out_dir.display()))
                 }
-                Ok(CopyOutResult::NothingToExport) => self.log.log("teardown: nothing to export"),
+                Ok(CopyOutResult::NothingToExport) => {
+                    export_complete = true;
+                    self.log.log("teardown: nothing to export");
+                }
                 Err(e) => self.log.log(&format!("teardown: EXPORT FAILED: {e}")),
             }
+        }
+        if let Some(registry) = &self.canaries {
+            self.monitoring_failed = finish_canaries(registry, self.paths, export_complete, self.canary_setup_complete, self.log);
         }
         match self.sb.remove() {
             Ok(()) => self.log.log(&format!("teardown: removed {}", self.paths.machine)),
@@ -775,7 +848,7 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
         }
     };
     sys::catch_termination_signals();
-    let mut live = Live { log: &log, sb: &sb, paths: &p, host: deps.host.as_ref(), machine_attempted: false, machine_created: false, child: None, network_pids: vec![], audit_dir: None };
+    let mut live = Live { log: &log, sb: &sb, paths: &p, host: deps.host.as_ref(), machine_attempted: false, machine_created: false, child: None, network_pids: vec![], audit_dir: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
     let code = match session_body(cfg, &deps, &run, &operator_home, &supervisor, &mut live) {
         Ok(code) => code,
         Err(e) => {
@@ -786,7 +859,7 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
     // Refuse later tool calls; teardown waits for the active exec lock before export.
     StateDir(p.state_dir.clone()).mark("session ended");
     live.teardown("session ended");
-    code
+    if live.monitoring_failed { 1 } else { code }
 }
 
 fn interrupted(log: &Logger) -> Option<String> {
@@ -857,6 +930,9 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce:
     // Only a network session carries the key, so a no-network bridge is unchanged.
     if !cfg.network.is_empty() {
         bridge["proxy"] = json!(true);
+    }
+    if !cfg.canaries.is_empty() {
+        bridge["canaryRegistry"] = json!(p.runtime.join("canaries/registry.json"));
     }
     json!({
         "machine": p.machine,
@@ -939,6 +1015,23 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         live.log.log(&format!("copied {} to /in", inputs.display()));
         step.ok(&format!("{} → /in", inputs.display()));
     }
+    if !cfg.canaries.is_empty() {
+        let registry = match crate::canary::Registry::create(&cfg.canaries, &p.runtime.join("canaries"), &p.session_dir.join("canaries.jsonl")) {
+            Ok(registry) => registry,
+            Err(error) => {
+                // Creation can fail after generating some host-only markers.
+                if p.runtime.join("canaries").exists() {
+                    fs::remove_dir_all(p.runtime.join("canaries")).map_err(|_| "canary setup failed and private token cleanup failed".to_string())?;
+                }
+                return Err(error);
+            }
+        };
+        live.canaries = Some(registry);
+        let registry = live.canaries.as_ref().expect("just set");
+        install_canary_files(live.sb, registry)?;
+        live.canary_setup_complete = true;
+        live.log.log(&format!("canaries: {} synthetic markers; guest manifest {}", cfg.canaries.len(), registry.manifest_path()));
+    }
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()).or_else(limit) {
         return Err(format!("{why} before opencode started"));
     }
@@ -948,7 +1041,10 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.log.log(&format!("sampling host RSS of pid {} (found via {})", supervisor.pid, supervisor.pid_file.display()));
 
     let nonce = new_nonce();
-    let plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
+    let mut plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
+    if let Some(registry) = &live.canaries {
+        plugin_options["canaryManifest"] = json!(registry.manifest_path());
+    }
     write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider, cfg.embedded_inference)?;
     // run_connected reaches the session for embedded inference only after
     // attestation verified; an external provider is recorded unattested.
@@ -1232,6 +1328,124 @@ mod tests {
         assert_eq!(c["enabled_providers"], json!(["ironwire"]));
         assert_eq!(c["provider"]["ironwire"]["options"]["baseURL"], "http://127.0.0.1:8463/openai/v1");
         assert!(c.get("mcp").is_none());
+    }
+
+    #[test]
+    fn managed_canary_setup_failure_is_not_complete_coverage() {
+        let d = tempdir("canary-setup-failure");
+        let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+        prepare_session_dirs(&p).unwrap();
+        let specs = [crate::canary::CanarySpec { id: "decoy".into(), placement: crate::canary::Placement::Guest }];
+        let registry = crate::canary::Registry::create(&specs, &p.runtime.join("canaries"), &p.session_dir.join("canaries.jsonl")).unwrap();
+        let guest = crate::testutil::Recorder::new(|_, _| crate::testutil::reply(1, b"", b"mkdir failed"));
+        assert!(install_canary_files(&guest, &registry).is_err());
+        let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+        assert!(finish_canaries(&registry, &p, true, false, &log));
+        let result: Value = serde_json::from_slice(&fs::read(p.session_dir.join("canary-summary.json")).unwrap()).unwrap();
+        assert_eq!(result["status"], "incomplete");
+        assert_eq!(result["setup"], "incomplete");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn managed_canary_cleanup_failure_is_persisted_as_incomplete() {
+        let d = tempdir("canary-cleanup-failure");
+        let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+        prepare_session_dirs(&p).unwrap();
+        let specs = [crate::canary::CanarySpec { id: "host-key".into(), placement: crate::canary::Placement::Host }];
+        let registry = crate::canary::Registry::create(&specs, &p.runtime.join("canaries"), &p.session_dir.join("canaries.jsonl")).unwrap();
+        fs::rename(p.runtime.join("canaries"), p.runtime.join("saved-canaries")).unwrap();
+        fs::write(p.runtime.join("canaries"), "blocks directory cleanup").unwrap();
+        let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+        assert!(finish_canaries(&registry, &p, true, true, &log));
+        let result: Value = serde_json::from_slice(&fs::read(p.session_dir.join("canary-summary.json")).unwrap()).unwrap();
+        assert_eq!(result["status"], "incomplete");
+        assert_eq!(result["tokenCleanup"], "failed");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn managed_canary_summary_write_failure_logs_incomplete() {
+        let d = tempdir("canary-summary-failure");
+        let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+        prepare_session_dirs(&p).unwrap();
+        let specs = [crate::canary::CanarySpec { id: "host-key".into(), placement: crate::canary::Placement::Host }];
+        let registry = crate::canary::Registry::create(&specs, &p.runtime.join("canaries"), &p.session_dir.join("canaries.jsonl")).unwrap();
+        fs::create_dir(p.session_dir.join("canary-summary.json")).unwrap();
+        let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+        assert!(finish_canaries(&registry, &p, true, true, &log));
+        let logged = fs::read_to_string(&p.log_file).unwrap();
+        assert!(logged.contains("canaries: incomplete;"));
+        assert!(!logged.contains("canaries: complete;"));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn managed_canary_teardown_scans_exports_and_removes_values() {
+        let d = tempdir("canary-summary");
+        let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+        prepare_session_dirs(&p).unwrap();
+        let specs = [crate::canary::CanarySpec { id: "decoy".into(), placement: crate::canary::Placement::Guest }];
+        let registry = crate::canary::Registry::create(&specs, &p.runtime.join("canaries"), &p.session_dir.join("canaries.jsonl")).unwrap();
+        let (_, token) = registry.guest_files().into_iter().find(|(name, _)| name.ends_with(".token")).unwrap();
+        fs::create_dir(&p.out_dir).unwrap();
+        fs::write(p.out_dir.join("collected.bin"), &token).unwrap();
+        let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+        assert!(!finish_canaries(&registry, &p, true, true, &log));
+        let result: Value = serde_json::from_slice(&fs::read(p.session_dir.join("canary-summary.json")).unwrap()).unwrap();
+        assert_eq!(result["status"], "complete");
+        assert_eq!(result["exportObservations"], 1);
+        assert!(!p.runtime.join("canaries").exists());
+        assert_eq!(fs::read(p.out_dir.join("collected.bin")).unwrap(), token);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn managed_canary_teardown_reports_incomplete_monitoring() {
+        for tool_failed in [false, true] {
+            let d = tempdir("canary-incomplete");
+            let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+            prepare_session_dirs(&p).unwrap();
+            let specs = [crate::canary::CanarySpec { id: "host-key".into(), placement: crate::canary::Placement::Host }];
+            let registry = crate::canary::Registry::create(&specs, &p.runtime.join("canaries"), &p.session_dir.join("canaries.jsonl")).unwrap();
+            if tool_failed { fs::write(p.state_dir.join("canary-monitoring-failed"), "failed").unwrap(); }
+            let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+            assert!(finish_canaries(&registry, &p, tool_failed, true, &log));
+            let result: Value = serde_json::from_slice(&fs::read(p.session_dir.join("canary-summary.json")).unwrap()).unwrap();
+            assert_eq!(result["status"], "incomplete");
+            assert_eq!(result["exportScan"], if tool_failed { "complete" } else { "incomplete" });
+            assert!(!p.runtime.join("canaries").exists());
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn managed_canary_plugin_options_are_opt_in_and_contain_no_values() {
+        let d = tempdir("canary-options");
+        let p = session_paths("0123456789ab", &d, &d.join("runtime"));
+        let mut cfg = session_cfg(&d, &d, provider());
+        let disabled = plugin_options(&p, &cfg, Path::new("/x/rts"), "nonce", "/host");
+        assert!(disabled["bridge"].get("canaryRegistry").is_none());
+        cfg.canaries = vec![crate::canary::CanarySpec { id: "decoy".into(), placement: crate::canary::Placement::Guest }];
+        let enabled = plugin_options(&p, &cfg, Path::new("/x/rts"), "nonce", "/host");
+        assert_eq!(enabled["bridge"]["canaryRegistry"], json!(p.runtime.join("canaries/registry.json")));
+        assert!(!enabled.to_string().contains("RTS_CANARY_"));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn managed_canary_context_explains_observations_and_manifest() {
+        let d = tempdir("canary-instructions");
+        let plugin = d.join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        let opts = json!({ "canaryManifest": "/tmp/rts/canaries-test/manifest.json" });
+        let file = write_opencode_config(&d.join("cfg"), &plugin, &opts, &provider(), false).unwrap();
+        let config: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+        let context = fs::read_to_string(config["instructions"][0].as_str().unwrap()).unwrap();
+        assert!(context.contains("/tmp/rts/canaries-test/manifest.json"));
+        assert!(context.contains("exact token matches"));
+        assert!(context.contains("not proof"));
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -1756,7 +1970,7 @@ mod tests {
         let worker = thread::spawn(move || {
             let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
             let sb = MvmSandbox::new(&p.machine, Box::new(f.clone())).unwrap();
-            let mut live = Live { log: &log, sb: &sb, paths: &p, host: f.as_ref(), machine_attempted: true, machine_created: true, child: None, network_pids: vec![], audit_dir: None };
+            let mut live = Live { log: &log, sb: &sb, paths: &p, host: f.as_ref(), machine_attempted: true, machine_created: true, child: None, network_pids: vec![], audit_dir: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
             started_tx.send(()).unwrap();
             live.teardown("test");
         });
@@ -2217,6 +2431,7 @@ mod tests {
             log: &log, sb: &sb, paths: &p, host: f.as_ref(),
             machine_attempted: true, machine_created: false, child: None,
             network_pids: vec![4243, 4245], audit_dir: Some(d.join("no-such-audit")),
+            canaries: None, monitoring_failed: false, canary_setup_complete: false,
         };
         live.teardown("test");
         let text = fs::read_to_string(&p.log_file).unwrap();

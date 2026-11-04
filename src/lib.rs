@@ -1,3 +1,4 @@
+pub mod canary;
 pub mod attest;
 pub mod brand;
 pub mod bridge;

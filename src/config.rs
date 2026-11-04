@@ -160,6 +160,8 @@ pub struct OperatorConfig {
     pub network: Vec<String>,
     /// `"updateCheck"`: the launch update check (default on).
     pub update_check: bool,
+    /// Synthetic canaries managed by the launcher; disabled when empty.
+    pub canaries: Vec<crate::canary::CanarySpec>,
 }
 
 #[derive(Deserialize, Default)]
@@ -210,6 +212,8 @@ struct Raw {
     #[serde(default)]
     network: RawNetwork,
     update_check: Option<bool>,
+    #[serde(default)]
+    canaries: Vec<crate::canary::CanarySpec>,
 }
 
 fn is_env_name(s: &str) -> bool {
@@ -450,6 +454,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         session_hours: session_hours(l.session_hours.as_ref(), dl.session_hours)?,
         rss_ceiling_set: l.host_rss_ceiling_mib.is_some(),
     };
+    crate::canary::validate_specs(&raw.canaries).map_err(|e| format!("config: canaries: {e}"))?;
     let network = raw.network.allow.unwrap_or_default();
     crate::network::expand(&network).map_err(|e| format!("config: network.allow: {e}"))?;
     let path = |v: Option<String>, k: &str| -> Result<Option<PathBuf>, String> {
@@ -475,6 +480,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         plugin_dir: path(raw.plugin_dir, "pluginDir")?.unwrap_or_else(|| d.plugin_dir.clone()),
         network,
         update_check: raw.update_check.unwrap_or(true),
+        canaries: raw.canaries,
     })
 }
 
@@ -495,6 +501,23 @@ mod tests {
             plugin_dir: "/repo/plugin".into(),
             opencode: "opencode".into(),
             sessions_dir: "/repo/sessions".into(),
+        }
+    }
+
+    #[test]
+    fn managed_canaries_accept_both_placements() {
+        assert!(parse(r#"{"canaries":[{"id":"review-key","placement":"guest"},{"id":"host-key","placement":"host"}]}"#).is_ok());
+    }
+
+    #[test]
+    fn managed_canaries_reject_invalid_or_ambiguous_specs() {
+        for entries in [
+            r#"[{"id":"../escape","placement":"host"}]"#,
+            r#"[{"id":"x","placement":"guest"},{"id":"x","placement":"host"}]"#,
+            r#"[{"id":"x","placement":"remote"}]"#,
+            r#"[{"id":"x","placement":"host","value":"secret"}]"#,
+        ] {
+            assert!(parse(&format!("{{\"canaries\":{entries}}}")).is_err());
         }
     }
 
