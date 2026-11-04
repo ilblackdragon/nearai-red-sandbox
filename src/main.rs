@@ -29,6 +29,51 @@ struct VmSize {
     memory_mib: Option<u32>,
 }
 
+/// Operator-supplied task text; never part of the persistent session configuration.
+#[derive(Debug)]
+enum PromptSource {
+    Text(String),
+    File(PathBuf),
+}
+
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
+
+impl PromptSource {
+    fn read(&self) -> Result<String, String> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let text = match self {
+            Self::Text(text) => text.clone(),
+            Self::File(path) => {
+                // Nonblocking open makes a mistaken FIFO path fail rather than
+                // hanging before we can verify the opened object is a file.
+                let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK)
+                    .open(path).map_err(|e| format!("cannot read prompt file {}: {e}", path.display()))?;
+                if !file.metadata().map_err(|e| format!("cannot inspect prompt file {}: {e}", path.display()))?.is_file() {
+                    return Err(format!("prompt file {} must be a regular file", path.display()));
+                }
+                let mut bytes = Vec::new();
+                file.take((MAX_PROMPT_BYTES + 1) as u64).read_to_end(&mut bytes)
+                    .map_err(|e| format!("cannot read prompt file {}: {e}", path.display()))?;
+                if bytes.len() > MAX_PROMPT_BYTES {
+                    return Err(format!("initial prompt must be at most {MAX_PROMPT_BYTES} bytes"));
+                }
+                String::from_utf8(bytes).map_err(|_| "prompt file must contain UTF-8 text".to_string())?
+            }
+        };
+        if text.len() > MAX_PROMPT_BYTES {
+            return Err(format!("initial prompt must be at most {MAX_PROMPT_BYTES} bytes"));
+        }
+        if text.trim().is_empty() {
+            return Err("initial prompt must not be empty or whitespace-only".into());
+        }
+        if text.contains('\0') {
+            return Err("initial prompt must not contain NUL bytes".into());
+        }
+        Ok(text)
+    }
+}
+
 #[derive(Debug)]
 enum Action {
     Help,
@@ -44,6 +89,7 @@ enum Action {
         network: NetworkFlags,
         vm: VmSize,
         no_splash: bool,
+        prompt: Option<PromptSource>,
     },
 }
 
@@ -67,18 +113,17 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     if !matches!(*command, "launch" | "login") {
         return Err("Unknown command".into());
     }
-    if flags.iter().any(|flag| matches!(*flag, "--help" | "-h")) {
-        return Ok(Action::Help);
-    }
     let mut file = None;
     let mut login = auth::LoginOptions::default();
     let mut attest = attest::AttestOptions::default();
     let mut network = NetworkFlags::default();
     let mut vm = VmSize::default();
     let mut no_splash = false;
+    let mut prompt = None;
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(&flag) = flags.next() {
+        if matches!(flag, "--help" | "-h") { return Ok(Action::Help); }
         let launch_only = matches!(
             flag,
             "--config"
@@ -90,6 +135,8 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
                 | "--no-splash"
                 | "--cpus"
                 | "--memory"
+                | "--prompt"
+                | "--prompt-file"
         );
         if !matches!(
             flag,
@@ -105,6 +152,8 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
                 | "--no-splash"
                 | "--cpus"
                 | "--memory"
+                | "--prompt"
+                | "--prompt-file"
         ) || (launch_only && *command != "launch")
         {
             return Err(format!("Unknown option for {command}: {flag}"));
@@ -132,10 +181,20 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
         let value = flags
             .next()
             .copied()
-            .filter(|value| !value.is_empty() && !value.starts_with('-'))
+            .filter(|value| !value.is_empty() && (flag == "--prompt" || !value.starts_with('-')))
             .ok_or_else(|| format!("{flag} needs a value"))?;
         match flag {
             "--config" => file = Some(PathBuf::from(value)),
+            "--prompt" | "--prompt-file" => {
+                if prompt.is_some() {
+                    return Err("--prompt and --prompt-file cannot be combined".into());
+                }
+                prompt = Some(if flag == "--prompt" {
+                    PromptSource::Text(value.into())
+                } else {
+                    PromptSource::File(PathBuf::from(value))
+                });
+            }
             "--allow-host" => network.allow.push(value.into()),
             "--cpus" => {
                 vm.cpus = Some(
@@ -191,6 +250,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             network,
             vm,
             no_splash,
+            prompt,
         }
     })
 }
@@ -254,7 +314,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE]\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 /// A private temp directory holding an empty Git config for mvmctl.
 fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
@@ -393,6 +453,7 @@ fn launch(
     network: &NetworkFlags,
     vm: &VmSize,
     no_splash: bool,
+    initial_prompt: Option<&str>,
 ) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
     let mut cfg = if let Some(file) = file {
@@ -404,6 +465,11 @@ fn launch(
             &defaults,
         )?
     };
+    if initial_prompt.is_some() {
+        // A source-built launcher paired with an older installed plugin must
+        // fail before sign-in/VM creation, not silently leave the task unsent.
+        session::check_tui_plugin(&cfg.plugin_dir)?;
+    }
     apply_network(&mut cfg, network);
     apply_vm_size(&mut cfg, vm)?;
     let host_cpus = std::thread::available_parallelism()
@@ -510,7 +576,7 @@ fn launch(
                 },
             ))
         },
-        |cfg| session::run_session(cfg, deps),
+        |cfg| session::run_session_with_prompt(cfg, deps, initial_prompt),
     )
 }
 
@@ -583,7 +649,14 @@ fn main() -> ExitCode {
             network,
             vm,
             no_splash,
-        } => launch(file.as_deref(), &login, attest, &network, &vm, no_splash),
+            prompt,
+        } => {
+            let initial_prompt = prompt.as_ref().map(PromptSource::read).transpose();
+            match initial_prompt {
+                Ok(prompt) => launch(file.as_deref(), &login, attest, &network, &vm, no_splash, prompt.as_deref()),
+                Err(error) => Err(error),
+            }
+        },
         Action::Login(options) => auth::login(&options).map(|_| {
             println!("Signed in to NEAR AI Cloud.");
             0
@@ -652,6 +725,68 @@ mod tests {
             allow_unattested_provider: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn launch_accepts_an_initial_prompt_or_prompt_file() {
+        assert!(parse_args(&["launch", "--prompt", "Inspect /in and report in /out"]).is_ok());
+        assert!(parse_args(&["launch", "--prompt-file", "handoff.md"]).is_ok());
+    }
+
+    #[test]
+    fn prompt_options_are_launch_only_exclusive_and_not_repeatable() {
+        for flags in [
+            vec!["launch", "--prompt", "one", "--prompt", "two"],
+            vec!["launch", "--prompt-file", "a", "--prompt-file", "b"],
+            vec!["launch", "--prompt", "one", "--prompt-file", "b"],
+            vec!["launch", "--prompt-file", "b", "--prompt", "one"],
+            vec!["login", "--prompt", "one"],
+            vec!["login", "--prompt-file", "a"],
+            vec!["launch", "--prompt"],
+            vec!["launch", "--prompt-file"],
+        ] {
+            assert!(parse_args(&flags).is_err(), "accepted {flags:?}");
+        }
+        let Action::Launch { prompt: Some(source), .. } = parse_args(&["launch", "--prompt", "- review /in"]).unwrap() else { panic!("missing prompt") };
+        assert_eq!(source.read().unwrap(), "- review /in");
+        let Action::Launch { prompt: Some(source), .. } = parse_args(&["launch", "--prompt", "--help"]).unwrap() else { panic!("prompt was interpreted as a flag") };
+        assert_eq!(source.read().unwrap(), "--help");
+    }
+
+    #[test]
+    fn prompt_file_and_inline_text_preserve_exact_utf8_and_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("handoff.md");
+        let text = "  Examine 'quoted' $(literal) `literal` ☃\r\nThen save to /out.\n";
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(PromptSource::File(file.clone()).read().unwrap(), text);
+        assert_eq!(PromptSource::Text(text.into()).read().unwrap(), text);
+        // Keep relative CLI paths relative to the invoking directory, not --config.
+        let Action::Launch { prompt: Some(PromptSource::File(path)), .. } = parse_args(&["launch", "--config", "/elsewhere/session.json", "--prompt-file", "handoff.md"]).unwrap() else { panic!("missing prompt file") };
+        assert_eq!(path, Path::new("handoff.md"));
+    }
+
+    #[test]
+    fn invalid_prompt_content_and_paths_fail_before_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("prompt");
+        for text in ["", " \t\n", "bad\0prompt"] {
+            assert!(PromptSource::Text(text.into()).read().is_err());
+            std::fs::write(&file, text).unwrap();
+            assert!(PromptSource::File(file.clone()).read().is_err());
+        }
+        assert!(PromptSource::Text("x".repeat(MAX_PROMPT_BYTES + 1)).read().unwrap_err().contains("at most"));
+        assert_eq!(PromptSource::Text("x".repeat(MAX_PROMPT_BYTES)).read().unwrap().len(), MAX_PROMPT_BYTES);
+        std::fs::write(&file, vec![b'x'; MAX_PROMPT_BYTES + 1]).unwrap();
+        assert!(PromptSource::File(file.clone()).read().unwrap_err().contains("at most"));
+        std::fs::write(&file, [0xff]).unwrap();
+        assert!(PromptSource::File(file).read().unwrap_err().contains("UTF-8"));
+        assert!(PromptSource::File(dir.path().join("missing")).read().is_err());
+        assert!(PromptSource::File(dir.path().to_path_buf()).read().unwrap_err().contains("regular file"));
+        let fifo = dir.path().join("fifo");
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        assert!(PromptSource::File(fifo).read().unwrap_err().contains("regular file"));
     }
 
     #[test]

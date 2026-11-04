@@ -1,7 +1,8 @@
 // opencode v2.2.2 terminal UI plugin: one muted line in the home screen's
 // `home.footer` slot. Loaded only by the TUI from cli.json (written by rts
 // with the model display name and attestation status as options); the
-// server never loads this directory, so tools, MCP and models are untouched.
+// server never loads this directory. The optional startup helper submits through
+// the authenticated TUI client only after the launcher releases its handoff.
 //
 // No imports from @opencode/*: the default export is the plain
 // { id, setup } shape that Plugin.define returns
@@ -9,6 +10,7 @@
 // applies the Solid JSX transform to this file.
 
 import { footerText } from "./footer.ts"
+import { startInitialPrompt } from "./startup.ts"
 
 // The splash palette (scripts/splash/sandbox_demo.py): muted sand (S1) and
 // NEAR AI Red. Only the colours are set here; the text is footerText's.
@@ -24,7 +26,7 @@ export default {
     const text = footerText(context.options)
     const attested = context.options.attested === true && text.endsWith(TAIL)
     const head = attested ? text.slice(0, -TAIL.length) : text
-    context.ui.slot({
+    const removeSlot = context.ui.slot({
       append: "home.footer",
       render: () => (
         <box width="100%" paddingLeft={2} flexShrink={0}>
@@ -36,5 +38,8 @@ export default {
         </box>
       ),
     })
+    const stop = typeof context.options.initialPromptFile === "string"
+      ? startInitialPrompt(context, context.options.initialPromptFile) : undefined
+    return async () => { await stop?.(); removeSlot() }
   },
 }

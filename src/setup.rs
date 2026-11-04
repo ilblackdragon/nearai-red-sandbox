@@ -487,7 +487,7 @@ fn image_step(check: bool, c: &SetupContext) -> Result<Option<String>, String> {
 fn offline_check(c: &SetupContext) -> Result<Vec<String>, String> {
     let mut steps = Steps { check: true, lines: Vec::new(), failures: Vec::new() };
     let plugin = &c.defaults.plugin_dir;
-    let missing: Vec<String> = ["package.json", "index.ts", "branding/tui.tsx", "branding/footer.ts", crate::brand::theme::THEME_FILE]
+    let missing: Vec<String> = ["package.json", "index.ts", "branding/tui.tsx", "branding/footer.ts", "branding/startup.ts", crate::brand::theme::THEME_FILE]
         .iter()
         .map(|f| plugin.join(f))
         .filter(|p| !fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
@@ -981,6 +981,7 @@ mod tests {
             fs::create_dir_all(plugin.join("branding")).unwrap();
             fs::write(plugin.join("branding/tui.tsx"), "").unwrap();
             fs::write(plugin.join("branding/footer.ts"), "").unwrap();
+            fs::write(plugin.join("branding/startup.ts"), "").unwrap();
             fs::create_dir_all(plugin.join("branding/theme")).unwrap();
             fs::write(plugin.join(crate::brand::theme::THEME_FILE), "{}").unwrap();
             let defaults = Defaults {
@@ -1235,6 +1236,10 @@ mod tests {
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
         assert!(e.contains(&r.defaults.plugin_dir.join("branding/footer.ts").display().to_string()), "{e}");
+        fs::remove_file(r.defaults.plugin_dir.join("branding/startup.ts")).unwrap();
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let e = r.run(offline, &s).unwrap_err();
+        assert!(e.contains(&r.defaults.plugin_dir.join("branding/startup.ts").display().to_string()), "{e}");
         fs::remove_file(r.defaults.plugin_dir.join(crate::brand::theme::THEME_FILE)).unwrap();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();

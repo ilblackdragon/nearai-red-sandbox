@@ -114,6 +114,17 @@ ask the agent:
 > Review the code in /in for security issues. Save a report with file references,
 > reproduction steps, and suggested fixes to /out/findings.md.
 
+To submit that task as soon as the sandbox is ready, pass it to the launcher:
+
+```sh
+rts launch --config ./session.json --prompt 'Review /in for security issues. Save findings to /out/findings.md.'
+# Or keep a longer task in a UTF-8 file:
+rts launch --config ./session.json --prompt-file ./handoff.md
+```
+
+OpenCode stays interactive after submission. Choose one prompt option; files
+are relative to your current directory and can contain up to 64 KiB of text.
+
 Save any files you want to keep under `/out`. On teardown, SandBox exports that
 directory and removes the VM. Export and cleanup failures are recorded in
 `launcher.log`; check it before relying on the results. Other guest files are
