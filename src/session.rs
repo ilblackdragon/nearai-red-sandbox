@@ -189,8 +189,8 @@ pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Val
 
 /// opencode's terminal UI reads its own config, `cli.json` beside
 /// opencode.json; the server's `plugin` list does not load TUI plugins.
-/// The branding plugin only draws the home footer: opencode never loads a
-/// TUI-only directory on the server, so tools, MCP and models are untouched.
+/// The TUI plugin draws the home footer and optionally submits the launcher's
+/// initial task. It never installs tools, MCP servers, or model transforms.
 pub fn tui_config(plugin_dir: &Path, model_display: &str, attested: bool) -> Value {
     json!({
         // rts sets the window title; opencode would overwrite it on every route change.
@@ -204,10 +204,14 @@ pub fn tui_config(plugin_dir: &Path, model_display: &str, attested: bool) -> Val
 }
 
 pub fn write_tui_config(dir: &Path, plugin_dir: &Path, model_display: &str, attested: bool) -> Result<PathBuf, String> {
+    write_tui_config_with_prompt(dir, plugin_dir, model_display, attested, None)
+}
+
+pub fn check_tui_plugin(plugin_dir: &Path) -> Result<(), String> {
     // v2.2.2 marks a directory without a tui entry "unsupported" and says so
     // only in /plugins, so refuse a broken install here instead.
     let branding = plugin_dir.join(BRANDING_PLUGIN);
-    let missing: Vec<&str> = ["tui.tsx", "footer.ts"].into_iter().filter(|f| !branding.join(f).is_file()).collect();
+    let missing: Vec<&str> = ["tui.tsx", "footer.ts", "startup.ts"].into_iter().filter(|f| !branding.join(f).is_file()).collect();
     if !missing.is_empty() {
         return Err(format!(
             "branding plugin {} is missing {}; reinstall rts or fix pluginDir",
@@ -215,9 +219,18 @@ pub fn write_tui_config(dir: &Path, plugin_dir: &Path, model_display: &str, atte
             missing.join(" and ")
         ));
     }
+    Ok(())
+}
+
+fn write_tui_config_with_prompt(dir: &Path, plugin_dir: &Path, model_display: &str, attested: bool, prompt_file: Option<&Path>) -> Result<PathBuf, String> {
+    check_tui_plugin(plugin_dir)?;
     fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let file = dir.join("cli.json");
-    let text = serde_json::to_string_pretty(&tui_config(plugin_dir, model_display, attested)).unwrap() + "\n";
+    let mut config = tui_config(plugin_dir, model_display, attested);
+    if let Some(path) = prompt_file {
+        config["plugins"][0]["options"]["initialPromptFile"] = json!(path);
+    }
+    let text = serde_json::to_string_pretty(&config).unwrap() + "\n";
     write_private(&file, text.as_bytes()).map_err(|e| format!("writing {}: {e}", file.display()))?;
     Ok(file)
 }
@@ -294,6 +307,34 @@ pub fn prepare_session_dirs(p: &SessionPaths) -> io::Result<()> {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(d)?;
     }
     fs::write(&p.empty_git_config, "")
+}
+
+/// Publish a complete private payload atomically. The TUI can begin reading as
+/// soon as this rename happens; it must never observe partial JSON.
+fn publish_initial_prompt(file: &Path, text: &str, provider: &ProviderConfig) -> Result<(), String> {
+    let payload = json!({ "text": text, "providerID": provider.id, "modelID": provider.models[0] });
+    let pending = file.with_extension("pending");
+    write_private(&pending, serde_json::to_string(&payload).unwrap().as_bytes())
+        .map_err(|e| format!("cannot prepare initial prompt: {e}"))?;
+    fs::rename(&pending, file).map_err(|e| format!("cannot publish initial prompt: {e}"))
+}
+
+fn initial_prompt_ack(file: &Path) -> Result<Option<String>, String> {
+    let bytes = match fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read initial prompt acknowledgement: {e}")),
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid initial prompt acknowledgement")?;
+    if value["status"] == "error" {
+        // Never echo arbitrary plugin/provider error text into launcher.log.
+        return Err("OpenCode could not submit the initial prompt".into());
+    }
+    let id = value["sessionID"].as_str().filter(|s| !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+    match (value["status"].as_str(), id) {
+        (Some("submitted"), Some(id)) => Ok(Some(id.into())),
+        _ => Err("invalid initial prompt acknowledgement".into()),
+    }
 }
 
 pub struct Launch {
@@ -812,6 +853,12 @@ impl Live<'_> {
 /// Run one session. Returns opencode's exit code, or 1 when the session
 /// was refused or failed.
 pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
+    run_session_with_prompt(cfg, deps, None)
+}
+
+/// Submit operator task text only after the sandbox plugin has authenticated.
+/// Prompt text stays out of process arguments and durable session metadata.
+pub fn run_session_with_prompt(cfg: &OperatorConfig, deps: Deps, initial_prompt: Option<&str>) -> i32 {
     let id = deps.session_id.clone().unwrap_or_else(new_session_id);
     let runtime = std::env::temp_dir().join(format!("rts-{id}-{}", random_hex(4)));
     let p = session_paths(&id, &cfg.sessions_dir, &runtime);
@@ -849,7 +896,7 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
     };
     sys::catch_termination_signals();
     let mut live = Live { log: &log, sb: &sb, paths: &p, host: deps.host.as_ref(), machine_attempted: false, machine_created: false, child: None, network_pids: vec![], audit_dir: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
-    let code = match session_body(cfg, &deps, &run, &operator_home, &supervisor, &mut live) {
+    let code = match session_body(cfg, &deps, &run, &operator_home, &supervisor, &mut live, initial_prompt) {
         Ok(code) => code,
         Err(e) => {
             log.log(&e);
@@ -946,7 +993,7 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce:
     })
 }
 
-fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, supervisor: &Path, live: &mut Live) -> Result<i32, String> {
+fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, supervisor: &Path, live: &mut Live, initial_prompt: Option<&str>) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
     let step = crate::brand::progress::step("host check", Shown::Sweep);
@@ -1048,7 +1095,8 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider, cfg.embedded_inference)?;
     // run_connected reaches the session for embedded inference only after
     // attestation verified; an external provider is recorded unattested.
-    write_tui_config(&p.config_dir, &cfg.plugin_dir, &model_display_name(&cfg.provider.models[0]), cfg.embedded_inference)?;
+    let prompt_file = p.config_dir.join("initial-prompt.json");
+    write_tui_config_with_prompt(&p.config_dir, &cfg.plugin_dir, &model_display_name(&cfg.provider.models[0]), cfg.embedded_inference, initial_prompt.map(|_| prompt_file.as_path()))?;
     crate::brand::theme::install(&cfg.plugin_dir, &p.config_dir)?;
     // opencode loads opencode.json, AGENTS.md and .opencode/ from its cwd.
     if fs::read_dir(&p.work).map_err(|e| e.to_string())?.next().is_some() {
@@ -1085,6 +1133,30 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         transport_error.is_some() || signalled.is_some() || child.try_wait().ok().flatten().is_some()
     })
     .map_err(|e| transport_error.or(signalled).unwrap_or_else(|| format!("refusing the session: {e}")))?;
+    if let Some(text) = initial_prompt {
+        // Publishing this file is the authorization signal to the TUI plugin.
+        // It is deliberately absent until the exact server-plugin nonce passes.
+        publish_initial_prompt(&prompt_file, text, &cfg.provider)?;
+        let deadline = Instant::now() + Duration::from_millis(cfg.limits.handshake_ms);
+        let ack = prompt_file.with_file_name("initial-prompt.json.ack");
+        loop {
+            terminal.pump().map_err(|e| format!("terminal relay failed: {e}"))?;
+            if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()).or_else(limit) {
+                return Err(why);
+            }
+            if let Some(id) = initial_prompt_ack(&ack)? {
+                live.log.log(&format!("initial prompt submitted to OpenCode session {id}"));
+                break;
+            }
+            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                return Err("OpenCode exited before acknowledging the initial prompt".into());
+            }
+            if Instant::now() >= deadline {
+                return Err("OpenCode did not acknowledge the initial prompt before the handshake timeout".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     terminal.enable_input().map_err(|e| format!("enabling terminal input failed: {e}"))?;
     live.log.log("plugin ready; session running");
 
@@ -1575,11 +1647,57 @@ mod tests {
         let e = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap_err();
         assert!(e.contains("footer.ts"), "{e}");
         fs::write(plugin.join("branding/footer.ts"), "").unwrap();
+        let e = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap_err();
+        assert!(e.contains("startup.ts"), "{e}");
+        fs::write(plugin.join("branding/startup.ts"), "").unwrap();
         let file = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap();
         assert_eq!(file, d.join("cfg/cli.json"));
         assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         let v: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(v, tui_config(&plugin, "m", true));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn the_initial_prompt_handoff_is_private_and_not_in_configuration_or_argv() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir("prompt-handoff");
+        let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin");
+        let prompt_file = d.join("initial-prompt.json");
+        let config = write_tui_config_with_prompt(&d, &plugin, "m", true, Some(&prompt_file)).unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
+        assert_eq!(v["plugins"][0]["options"]["initialPromptFile"], json!(prompt_file));
+        assert!(!prompt_file.exists(), "writing TUI configuration must not release the prompt");
+        let text = "secret task 'quoted'\r\n☃\t$(literal)";
+        publish_initial_prompt(&prompt_file, text, &provider()).unwrap();
+        assert_eq!(fs::metadata(&prompt_file).unwrap().permissions().mode() & 0o777, 0o600);
+        let v: Value = serde_json::from_slice(&fs::read(&prompt_file).unwrap()).unwrap();
+        assert_eq!(v, json!({ "text": text, "providerID": provider().id, "modelID": provider().models[0] }));
+        assert!(!prompt_file.with_extension("pending").exists());
+        let paths = session_paths("0123456789ab", &d, &d);
+        assert_eq!(opencode_launch(&paths, "opencode", Vec::new()).argv, sv(&["opencode", "--standalone"]));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn initial_prompt_acknowledgement_requires_success_and_sanitizes_errors() {
+        let d = tempdir("prompt-ack");
+        let file = d.join("prompt.ack");
+        assert_eq!(initial_prompt_ack(&file).unwrap(), None);
+        fs::write(&file, r#"{"status":"submitted","sessionID":"ses_123-abc"}"#).unwrap();
+        assert_eq!(initial_prompt_ack(&file).unwrap(), Some("ses_123-abc".into()));
+        for value in [
+            json!({ "status": "error", "message": "secret prompt content" }),
+            json!({ "status": "submitted", "sessionID": "injected\nlog" }),
+            json!({ "status": "submitted" }),
+            json!({ "status": "pending", "sessionID": "ses_1" }),
+        ] {
+            fs::write(&file, value.to_string()).unwrap();
+            let error = initial_prompt_ack(&file).unwrap_err();
+            assert!(!error.contains("secret") && !error.contains("injected"));
+        }
+        fs::write(&file, b"not json").unwrap();
+        assert!(initial_prompt_ack(&file).is_err());
         fs::remove_dir_all(d).unwrap();
     }
 
@@ -2167,7 +2285,7 @@ mod tests {
         // An installed plugin carries the branding TUI files; without them
         // the launcher refuses the session before the code under test runs.
         fs::create_dir_all(cfg.plugin_dir.join("branding")).unwrap();
-        for f in ["tui.tsx", "footer.ts"] {
+        for f in ["tui.tsx", "footer.ts", "startup.ts"] {
             fs::write(cfg.plugin_dir.join("branding").join(f), "").unwrap();
         }
         // and the shipped opencode theme, which session_body installs.
@@ -2280,6 +2398,27 @@ mod tests {
         let export = position(&calls, |c| c.contains("echo NONE")).expect("no export");
         assert!(probe < export, "{calls:?}");
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+    }
+
+    #[test]
+    fn a_failed_plugin_handshake_never_publishes_the_initial_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut s = net_session("prompt-no-handshake", &[]);
+        let started = s.d.join("config-path");
+        let script = s.d.join("opencode-stand-in");
+        fs::write(&script, format!("#!/bin/sh\nprintf '%s' \"$XDG_CONFIG_HOME/opencode\" > '{}'; exec /bin/sleep 30\n", started.display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        s.cfg.opencode = script.to_string_lossy().into_owned();
+        s.cfg.limits.handshake_ms = 250;
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        assert_eq!(run_session_with_prompt(&s.cfg, net_deps(&f, &s.mvm, Arc::new(NoResolve), &[]), Some("private initial task")), 1);
+        let config = fs::read_to_string(&started).expect("OpenCode stand-in must have started");
+        assert!(!Path::new(&config).join("initial-prompt.json").exists());
+        assert!(!Path::new(&config).join("initial-prompt.pending").exists());
+        let log = read_log(&s);
+        assert!(log.contains("plugin did not report ready"), "{log}");
+        assert!(!log.contains("private initial task"));
+        fs::remove_dir_all(&s.d).unwrap();
     }
 
     #[test]

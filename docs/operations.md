@@ -6,7 +6,7 @@ updates, terminal behavior, and the exact network policy and audit records.
 
 ## Session file
 
-Everything about a session can also come from a JSON file, passed with
+Session settings can come from a JSON file, passed with
 `rts launch --config PATH`. Every key is optional; an unknown key is refused,
 and relative paths are resolved against the file's own directory. Flags win
 over the file: `--cpus` and `--memory` replace its values, `--allow-host`
@@ -68,6 +68,30 @@ default. Replies are limited to 16,384 tokens and automatic compaction starts
 at 95,232 tokens, leaving 32,768 tokens for a reply and estimation/tool-result
 headroom. This is the proxy's enforced capacity, not a claim about the model's
 maximum supported window. Explicit external providers keep their own limits.
+
+## Initial task
+
+```sh
+rts launch --config ./session.json --prompt 'Inspect /in and save a report to /out/report.md'
+rts launch --config ./session.json --prompt-file ./handoff.md
+```
+
+The options are mutually exclusive and launch-only. `--prompt-file` reads a
+regular UTF-8 file relative to the invoking directory (not the directory of
+`--config`). Either form accepts at most 65,536 bytes and refuses empty,
+whitespace-only, or NUL-containing text before sign-in or VM creation. Text,
+including multiline content and quotes, is submitted as one message.
+
+The launcher waits for the sandbox plugin's nonce handshake, then hands the
+text to the TUI's authenticated session API. It waits for submission to be
+acknowledged before enabling terminal input, and leaves OpenCode interactive.
+Each handoff is consumed once; an ambiguous submission failure is reported
+without automatically retrying. `limits.handshakeMs` also bounds this
+acknowledgement step. No keystroke automation or public API server is needed.
+
+Prompt text is not placed in OpenCode's process arguments, launcher log, or
+`session.json`. Its private runtime payload is removed when consumed; the
+message becomes part of the normal OpenCode conversation and inference request.
 
 ## Dependency setup and verification
 
