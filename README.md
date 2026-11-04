@@ -125,7 +125,7 @@ rts launch --config ./session.json --prompt-file ./handoff.md
 OpenCode stays interactive after submission. Choose one prompt option; files
 are relative to your current directory and can contain up to 64 KiB of text.
 
-For agent-driven workflows, use the [sandbox skill](skills/nearai-red-sandbox/SKILL.md). It supports programmable terminals such as Rex and commands the operator runs manually.
+For agent-driven workflows, see [Use the sandbox skill](#use-the-sandbox-skill).
 
 Save any files you want to keep under `/out`. On teardown, SandBox exports that
 directory and removes the VM. Export and cleanup failures are recorded in
@@ -149,6 +149,46 @@ location is `~/.local/share/nearai-red-sandbox/sessions/ID/`:
 
 Available records depend on how far the session gets and which features it
 uses. The agent's findings and exported files still need your review.
+
+### Use the sandbox skill
+
+The [nearai-red-sandbox skill](skills/nearai-red-sandbox/SKILL.md) helps your
+agent stage the requested inputs, choose network access, submit an initial
+prompt, and retrieve the results. It supports both programmable terminals
+such as Rex and commands you run yourself.
+
+**Install in Codex:** ask Codex:
+
+> Install the skill from
+> https://github.com/nearai/nearai-red-sandbox/tree/main/skills/nearai-red-sandbox
+
+The skill will be available on your next turn. For another agent that supports
+skills, copy the entire `skills/nearai-red-sandbox` directory into that agent's
+skill location, including its `references` directory. Installing the skill
+does not install the sandbox CLI: the machine running the sandbox needs
+`rts` v0.1.2 or later and its setup dependencies, on Apple-silicon macOS.
+
+**Launch through Rex:** invoke the skill with the file, investigation question,
+and terminal preference:
+
+> $nearai-red-sandbox Review ~/Downloads/submission.jsonl to determine whether
+> the reported bug is supported by the evidence. Use Rex to launch a new
+> sandbox, allow public GitHub access, and save the report to /out/report.md.
+
+The agent opens a named tab, submits the task with `--prompt-file`, and checks
+that the sandbox and initial prompt are ready. OpenCode stays interactive.
+Other programmable terminals can use the same launcher command.
+
+**Get a command to run yourself:** make that preference explicit:
+
+> $nearai-red-sandbox Prepare a command for me to run on my Mac to review
+> ~/Downloads/submission.jsonl with public GitHub access. Save the report to
+> /out/report.md. Do not launch it for me.
+
+The agent supplies a shell block that stages the input, writes the config and
+prompt file, and invokes `rts launch`. A prepared command is not a running
+session. After you run it, the launcher prints the session's results path;
+exit OpenCode normally to export `/out`, then check the export result.
 
 ### VM size
 
